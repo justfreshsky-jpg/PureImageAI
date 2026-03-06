@@ -561,6 +561,13 @@ def _generate_via_pollinations(prompt, negative_prompt, width, height, num_image
     for i in range(min(num_images, 4)):
         seed_url = base_url + (f"&seed={i * 1000 + int(time.time()) % 10000}" if i > 0 else "")
         urls.append(seed_url)
+    # Validate that at least the first URL is reachable
+    try:
+        check = requests.head(urls[0], timeout=10, allow_redirects=True)
+        if check.status_code not in (200, 301, 302):
+            raise RuntimeError(f"Pollinations URL returned status {check.status_code}")
+    except Exception as exc:
+        raise RuntimeError(f"Pollinations image not reachable: {exc}")
     return urls
 
 
@@ -722,7 +729,7 @@ _HTML = """<!DOCTYPE html>
     transition: transform .2s, box-shadow .2s;
   }
   .img-card:hover { transform: translateY(-2px); box-shadow: 0 8px 30px rgba(79,70,229,.2); }
-  .img-card img { width: 100%; display: block; aspect-ratio: 1; object-fit: cover; }
+  .img-card img { width: 100%; display: block; aspect-ratio: 1; object-fit: cover; min-height: 200px; background: var(--surface2); }
   .img-card-footer {
     padding: .75rem 1rem;
     display: flex; justify-content: space-between; align-items: center; gap: .5rem;
@@ -901,8 +908,20 @@ function renderImages(images, elapsedMs) {
 
     const imgEl = document.createElement('img');
     imgEl.alt = 'Generated image ' + (i + 1);
+    imgEl.style.background = 'var(--surface2)';
+    imgEl.style.minHeight = '280px';
     imgEl.loading = 'lazy';
-    imgEl.src = src;
+
+    imgEl.onerror = function() {
+      const placeholder = document.createElement('div');
+      placeholder.style.cssText = 'width:100%;min-height:280px;display:flex;flex-direction:column;align-items:center;justify-content:center;background:var(--surface2);color:var(--muted);font-size:.85rem;gap:.5rem;padding:1rem;text-align:center;';
+      placeholder.innerHTML = '<span style="font-size:2rem">\uD83D\uDDBC\uFE0F</span><span>Image failed to load.<br>Try generating again.</span>';
+      this.replaceWith(placeholder);
+    };
+
+    // Use proxy for external URLs to avoid CORS issues
+    const displaySrc = src.startsWith('data:') ? src : '/proxy_image?url=' + encodeURIComponent(src);
+    imgEl.src = displaySrc;
 
     const footer = document.createElement('div');
     footer.className = 'img-card-footer';
@@ -1013,6 +1032,36 @@ def index():
 @app.route("/health")
 def health():
     return jsonify(status="ok")
+
+
+@app.route("/proxy_image")
+def proxy_image():
+    from urllib.parse import urlparse, urlunparse
+    from flask import Response
+    url = request.args.get("url", "")
+    allowed_hosts = (
+        "image.pollinations.ai",
+        "fal.media", "fal.run",
+        "replicate.delivery",
+        "pbxt.replicate.delivery",
+    )
+    parsed = urlparse(url)
+    netloc = parsed.netloc.split(":")[0]  # strip port if present
+    if not url or parsed.scheme not in ("http", "https") or not any(
+        netloc == h or netloc.endswith("." + h) for h in allowed_hosts
+    ):
+        return jsonify(error="Invalid or disallowed image URL"), 400
+    # Reconstruct URL from validated components to prevent SSRF bypass
+    safe_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", parsed.query, ""))
+    try:
+        resp = requests.get(safe_url, timeout=30)
+        if resp.status_code != 200:
+            return jsonify(error="Image fetch failed"), 502
+        content_type = resp.headers.get("Content-Type", "image/jpeg")
+        return Response(resp.content, status=200, content_type=content_type)
+    except Exception as exc:
+        logger.warning("proxy_image failed for %s: %s", safe_url, exc)
+        return jsonify(error="Could not fetch image"), 502
 
 
 @app.route("/generate", methods=["POST"])
