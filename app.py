@@ -70,7 +70,10 @@ def _check_global_rate_limit():
 def enforce_rate_limit():
     if request.method == "POST":
         if not _check_global_rate_limit():
-            return jsonify(error="Rate limit exceeded. Please wait a minute before making another request."), 429
+            return jsonify(
+                error="Rate limit exceeded. Please wait a minute before making another request.",
+                request_id=_get_request_id(),
+            ), 429
 
 
 # ── GENERATION-SPECIFIC RATE LIMITER (5/min per IP) ──────────
@@ -1145,8 +1148,10 @@ def proxy_image():
         "huggingface.co",
         "hf.co",
     )
-    netloc = parsed.netloc.split(":")[0]  # strip port if present
-    if parsed.scheme not in ("http", "https") or not any(
+    # Use parsed.hostname (not netloc.split(":")[0]) to correctly handle
+    # userinfo-in-URL SSRF bypass attempts like http://allowed.host:@evil.com/
+    netloc = parsed.hostname or ""
+    if parsed.scheme not in ("http", "https") or not netloc or not any(
         netloc == h or netloc.endswith("." + h) for h in allowed_hosts
     ):
         return jsonify(error="Disallowed image URL"), 400
@@ -1171,7 +1176,10 @@ def generate():
     t0 = time.time()
     try:
         if not _check_gen_rate_limit():
-            return jsonify(error="Too many requests. Please wait a moment and try again."), 429
+            return jsonify(
+                error="Too many requests. Please wait a moment and try again.",
+                request_id=_get_request_id(),
+            ), 429
 
         d = _json_body()
         raw_prompt = (d.get("prompt") or "").strip()
