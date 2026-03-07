@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 import types
 import unittest
 from unittest.mock import MagicMock, patch
@@ -265,6 +266,191 @@ class TestLlmHelper(unittest.TestCase):
 
         self.assertIsInstance(result, str)
         self.assertEqual(result, "enhanced text")
+
+
+# ===========================================================================
+# /proxy_image endpoint
+# ===========================================================================
+
+class TestProxyImageEndpoint(unittest.TestCase):
+
+    def setUp(self):
+        self.client = _client()
+
+    def test_missing_url_returns_400(self):
+        resp = self.client.get("/proxy_image")
+        self.assertEqual(resp.status_code, 400)
+        data = resp.get_json()
+        self.assertIn("error", data)
+
+    def test_disallowed_url_returns_400(self):
+        resp = self.client.get("/proxy_image?url=http://evil.com/bad.png")
+        self.assertEqual(resp.status_code, 400)
+        data = resp.get_json()
+        self.assertIn("error", data)
+
+    def test_disallowed_scheme_returns_400(self):
+        resp = self.client.get("/proxy_image?url=file:///etc/passwd")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_ssrf_userinfo_bypass_rejected(self):
+        """Userinfo-in-URL SSRF bypass must be rejected.
+
+        The URL ``http://fal.run:80@evil.com/image.png`` is parsed as:
+          - userinfo = ``fal.run:80`` (username:password)
+          - host     = ``evil.com``
+
+        The old ``netloc.split(":")[0]`` code extracted ``fal.run`` (the
+        username), which matched the allowlist and let the request through.
+        The fixed code uses ``parsed.hostname`` which correctly returns
+        ``evil.com``, which is not in the allowlist.
+        """
+        url = "http://fal.run:80@evil.com/image.png"
+        resp = self.client.get(f"/proxy_image?url={url}")
+        self.assertEqual(resp.status_code, 400)
+        data = resp.get_json()
+        self.assertIn("error", data)
+
+    def test_allowed_url_returns_image(self):
+        """An allowed upstream URL proxied successfully returns image bytes."""
+        fake_image = b"\x89PNG\r\n"
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.headers = {"Content-Type": "image/png"}
+        mock_resp.content = fake_image
+        with patch("requests.get", return_value=mock_resp):
+            resp = self.client.get(
+                "/proxy_image?url=https://image.pollinations.ai/prompt/test"
+            )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("image/", resp.content_type)
+        self.assertEqual(resp.data, fake_image)
+
+
+# ===========================================================================
+# Rate limiting — GET routes must be exempt
+# ===========================================================================
+
+class TestRateLimitingGetExemption(unittest.TestCase):
+    """GET routes must never be blocked by the POST-only global rate limiter."""
+
+    def setUp(self):
+        self.client = _client()
+
+    def test_health_never_rate_limited(self):
+        # Even if the rate limiter would reject, GET /health must return 200.
+        with patch.object(application, "_check_global_rate_limit", return_value=False):
+            resp = self.client.get("/health")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_debug_never_rate_limited(self):
+        with patch.object(application, "_check_global_rate_limit", return_value=False):
+            resp = self.client.get("/debug")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_index_never_rate_limited(self):
+        with patch.object(application, "_check_global_rate_limit", return_value=False):
+            resp = self.client.get("/")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_post_rate_limited_returns_429_with_request_id(self):
+        """A rate-limited POST must return 429 with a request_id field."""
+        with patch.object(application, "_check_global_rate_limit", return_value=False):
+            resp = _post_json(self.client, "/generate", {"prompt": "test"})
+        self.assertEqual(resp.status_code, 429)
+        data = resp.get_json()
+        self.assertIn("error", data)
+        self.assertIn("request_id", data)
+
+
+# ===========================================================================
+# request_id propagation
+# ===========================================================================
+
+class TestRequestIdPropagation(unittest.TestCase):
+    """Unhandled exceptions (500) must always include request_id in the response."""
+
+    def setUp(self):
+        self.client = _client()
+
+    def test_500_includes_request_id(self):
+        """When generate() raises unexpectedly, the 500 response includes request_id."""
+        with patch.object(application, "_check_gen_rate_limit", side_effect=RuntimeError("boom")):
+            resp = _post_json(self.client, "/generate", {"prompt": "a cat"})
+        self.assertEqual(resp.status_code, 500)
+        data = resp.get_json()
+        self.assertIn("request_id", data)
+        self.assertIsInstance(data["request_id"], str)
+        self.assertGreater(len(data["request_id"]), 0)
+
+    def test_enhance_prompt_500_includes_request_id(self):
+        """When enhance_prompt() raises unexpectedly, the 500 includes request_id."""
+        with patch.object(application, "_has_llm_key", side_effect=RuntimeError("boom")):
+            resp = _post_json(self.client, "/enhance_prompt", {"prompt": "a sunset"})
+        self.assertEqual(resp.status_code, 500)
+        data = resp.get_json()
+        self.assertIn("request_id", data)
+
+    def test_gen_rate_limit_429_includes_request_id(self):
+        """Per-endpoint 429 from _check_gen_rate_limit must include request_id."""
+        with patch.object(application, "_check_gen_rate_limit", return_value=False):
+            resp = _post_json(self.client, "/generate", {"prompt": "a cat"})
+        self.assertEqual(resp.status_code, 429)
+        data = resp.get_json()
+        self.assertIn("request_id", data)
+
+
+# ===========================================================================
+# Cache TTL behavior
+# ===========================================================================
+
+class TestCacheTTL(unittest.TestCase):
+    """Cache entries must be treated as expired once the TTL has passed."""
+
+    def test_llm_cache_entry_expires(self):
+        """An LLM cache entry older than _CACHE_TTL must not be returned."""
+        key = "ttl_test_llm_key"
+        # Write the entry while time is "now"
+        application._cache_set(key, "some result")
+        # Advance time past the TTL so the entry appears expired
+        future = time.time() + application._CACHE_TTL + 1
+        with patch("time.time", return_value=future):
+            result = application._cache_get(key)
+        self.assertIsNone(result)
+
+    def test_gen_cache_entry_expires(self):
+        """A generate cache entry older than _GENERATE_CACHE_TTL must not be returned."""
+        key = "ttl_test_gen_key"
+        application._gen_cache_set(key, ["http://example.com/x.png"], "pollinations")
+        future = time.time() + application._GENERATE_CACHE_TTL + 1
+        with patch("time.time", return_value=future):
+            urls, provider = application._gen_cache_get(key)
+        self.assertIsNone(urls)
+        self.assertIsNone(provider)
+        # clean up
+        with application._GENERATE_CACHE_LOCK:
+            application._GENERATE_CACHE.pop(key, None)
+
+    def test_llm_cache_fresh_entry_returned(self):
+        """A freshly written LLM cache entry must be returned before TTL expires."""
+        key = "ttl_test_llm_fresh"
+        application._cache_set(key, "fresh result")
+        result = application._cache_get(key)
+        self.assertEqual(result, "fresh result")
+        # clean up
+        with application._resp_cache_lock:
+            application._resp_cache.pop(key, None)
+
+    def test_gen_cache_fresh_entry_returned(self):
+        """A freshly written generate cache entry must be returned before TTL expires."""
+        key = "ttl_test_gen_fresh"
+        application._gen_cache_set(key, ["http://example.com/y.png"], "fal.ai")
+        urls, provider = application._gen_cache_get(key)
+        self.assertEqual(urls, ["http://example.com/y.png"])
+        self.assertEqual(provider, "fal.ai")
+        # clean up
+        with application._GENERATE_CACHE_LOCK:
+            application._GENERATE_CACHE.pop(key, None)
 
 
 if __name__ == "__main__":

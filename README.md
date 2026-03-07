@@ -78,9 +78,14 @@ Then open http://localhost:8080.
 ## Run Tests
 
 ```bash
-pip install pytest
+# Install dependencies (if not already done)
+pip install -r requirements.txt
+
+# Run all tests with verbose output
 pytest tests/ -v
 ```
+
+Tests cover: cache helpers (LLM and generate caches, TTL expiry), `/enhance_prompt` (happy path + error cases), `/generate` (happy path + error cases), `/health`, `/proxy_image` (SSRF rejection + allowed URL), rate-limit GET exemption, and `request_id` propagation in error responses.
 
 ## Deploy on Render
 
@@ -92,15 +97,25 @@ pytest tests/ -v
 
 ## Deploy on Google Cloud Run
 
+The app binds to `0.0.0.0` and respects the `$PORT` environment variable (default `8080`), which is required for Cloud Run.
+
 1. Build and push the Docker image:
    ```bash
    gcloud builds submit --tag gcr.io/PROJECT_ID/pureimage-ai
    ```
 2. Deploy the service:
    ```bash
-   gcloud run deploy pureimage-ai --image gcr.io/PROJECT_ID/pureimage-ai --platform managed --allow-unauthenticated
+   gcloud run deploy pureimage-ai \
+     --image gcr.io/PROJECT_ID/pureimage-ai \
+     --platform managed \
+     --allow-unauthenticated \
+     --set-env-vars "GROQ_KEY=your-key,FAL_KEY=your-key"
    ```
 3. Add environment variables for your API keys via the Cloud Run console or `--set-env-vars`.
+
+> **PORT binding:** Cloud Run injects the `$PORT` environment variable. The app reads it automatically — no extra configuration needed.
+
+> **Outbound requests:** The app uses the `requests` library for all provider calls. Proxy env vars (`HTTP_PROXY`, `HTTPS_PROXY`) are not set by default on Cloud Run and should not be configured unless your project requires them.
 
 ### Image Proxying
 
@@ -115,11 +130,20 @@ Generated images from external providers are served through the `/proxy_image` e
 
 | Endpoint | Status | Cause | Resolution |
 |---|---|---|---|
-| `/enhance_prompt` | 400 | Empty prompt | Enter a prompt |
+| `/enhance_prompt` | 400 | Empty or missing prompt | Enter a non-empty prompt |
+| `/enhance_prompt` | 400 | Prompt exceeds 4000 characters | Shorten the prompt |
 | `/enhance_prompt` | 503 | No LLM key configured | Set `GROQ_KEY` or another LLM key |
 | `/enhance_prompt` | 502 | All LLM providers failed | Check provider API key validity / quota |
-| `/generate` | 400 | Empty prompt | Enter a prompt |
-| `/generate` | 429 | Rate limit exceeded | Wait ~1 minute |
-| `/generate` | 503 | No image provider keys and Pollinations unreachable | Set `FAL_KEY`, `HF_KEY`, etc. |
-| `/generate` | 502 | All providers failed | Check provider API key validity / quota |
+| `/enhance_prompt` | 500 | Unexpected server error | Check logs for `request_id`; retry |
+| `/generate` | 400 | Empty or missing prompt | Enter a non-empty prompt |
+| `/generate` | 400 | Prompt exceeds 4000 characters | Shorten the prompt |
+| `/generate` | 429 | Global or per-endpoint rate limit exceeded | Wait ~1 minute; response includes `request_id` |
+| `/generate` | 503 | No image provider keys and Pollinations unreachable | Set `FAL_KEY`, `HF_KEY`, `STABILITY_KEY`, or `REPLICATE_KEY` |
+| `/generate` | 502 | All providers failed (keys present) | Check provider API key validity / quota |
+| `/generate` | 500 | Unexpected server error | Check logs for `request_id`; retry |
+| `/proxy_image` | 400 | Missing or disallowed URL | Only URLs from known providers are proxied |
+| `/proxy_image` | 502 | Upstream image fetch failed | Provider may be temporarily unavailable |
+
+> **request_id:** All 4xx rate-limit and 5xx responses include a `request_id` field. Use it to correlate
+> client-reported errors with server log entries (search for `request_id=<value>` in Cloud Run logs).
 
