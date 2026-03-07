@@ -24,6 +24,7 @@ HF_KEY          = os.environ.get("HF_KEY")
 STABILITY_KEY   = os.environ.get("STABILITY_KEY")
 REPLICATE_KEY   = os.environ.get("REPLICATE_KEY")
 PUREIMAGE_LOG_PATH = os.environ.get("PUREIMAGE_LOG_PATH", "/tmp/pureimage_feedback.log.jsonl")
+PROXY_USER_AGENT = "PureImageAI/1.0"
 
 client = Groq(api_key=GROQ_KEY) if GROQ_KEY else None
 
@@ -906,6 +907,7 @@ function renderImages(images, elapsedMs) {
     imgEl.loading = 'lazy';
 
     imgEl.onerror = function() {
+      console.error('Image failed to load:', displaySrc);
       const placeholder = document.createElement('div');
       placeholder.style.cssText = 'width:100%;min-height:280px;display:flex;flex-direction:column;align-items:center;justify-content:center;background:var(--surface2);color:var(--muted);font-size:.85rem;gap:.5rem;padding:1rem;text-align:center;';
       placeholder.innerHTML = '<span style="font-size:2rem">\uD83D\uDDBC\uFE0F</span><span>Image failed to load.<br>Try generating again.</span>';
@@ -1043,9 +1045,13 @@ def proxy_image():
         return jsonify(error="Invalid URL"), 400
     allowed_hosts = (
         "image.pollinations.ai",
-        "fal.media", "fal.run",
+        "fal.media",
+        "fal.run",
+        "fal.ai",
+        "storage.googleapis.com",
         "replicate.delivery",
-        "pbxt.replicate.delivery",
+        "huggingface.co",
+        "hf.co",
     )
     netloc = parsed.netloc.split(":")[0]  # strip port if present
     if parsed.scheme not in ("http", "https") or not any(
@@ -1055,7 +1061,7 @@ def proxy_image():
     # Reconstruct URL from validated components to prevent SSRF bypass
     safe_url = urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", parsed.query, ""))
     try:
-        resp = requests.get(safe_url, timeout=30, stream=True)
+        resp = requests.get(safe_url, timeout=60, stream=True, headers={"User-Agent": PROXY_USER_AGENT})
         if resp.status_code != 200:
             return jsonify(error="Image fetch failed"), 502
         content_type = (resp.headers.get("Content-Type") or "image/jpeg").split(";")[0].strip()
